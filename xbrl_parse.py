@@ -5,6 +5,8 @@ from bs4 import BeautifulSoup
 from pprint import pprint
 import pandas as pd
 from datetime import datetime
+from win32com.client import Dispatch
+
 
 class Company:
 	def __init__(self, cik):
@@ -22,6 +24,11 @@ class Company:
 
 		xml_file = urlopen(url_string)
 		self.xml = minidom.parse(xml_file)
+
+		self.task = 1
+		# Tasks:
+		# 1 - parse new reports
+		# 2 - parse all reports
 
 	def getDocuments(self):
 		"""
@@ -48,7 +55,7 @@ class Company:
 			try: 
 				parent = document.getElementsByTagName('content')[0]
 				if parent.getElementsByTagName('filing-type')[0].firstChild.nodeValue in self.forms:
-					parent.getElementsByTagName('xbrl_href')[0].firstChild.nodeValue
+					parent.getElementsByTagName('xbrl_href')[0].firstChild.nodeValue #check for XBRL data
 					doc = Document(parent)
 					doc.data['file'] = self.datapath + '/{}_{}.{}'.format(
 						str(doc.data['filing_type']).replace('/',''), 
@@ -58,47 +65,72 @@ class Company:
 						f = open( doc.data['file'], 'x+b')
 						f.write( urlopen( doc.data['xbrl_url']).read())
 						f.close()
+						self.documents.append(doc)
+						print('-  +', doc.data['file'])
 					except FileExistsError: #file already exists
+						if self.task == 2: 
+							self.documents.append(doc)
 						pass
-					self.documents.append(doc)
 			except IndexError: #no xbrl data
 				pass
 
-	def getSeries(self, codes):
-		'''
-		'''
+	def getSeries(self, codes, data):
+		dataNew = {}
 		if len(self.documents) == 0:
 			self.getDocuments()
 		if len(self.documents) == 0:
-			raise Exception("No data available from Edgar")
+			print('--- No new data')
+			return pd.DataFrame(dataNew)
 		documents = self.documents
 
 		collected = {}
 		for code in codes:
 			collected[code] = {}
-		result = collected
+			dataNew[code] = {}
 		
 		for document in documents:
 			datas = document.getItems(codes)
 			for code in datas:
 				for period in datas[code]:
+					isSet = True
 					if period in collected[code]:
+						isSet = False
 						if collected[code][period][0] != datas[code][period]:
-							print('Code: ', code,'. Period: ', period,'. Err: different values',
-							' x: ', collected[code][period][0], '(',collected[code][period][1],')',
-							' xx: ', datas[code][period], '(',document.data['fixing_date'],')')
-							if document.getDate(document.data['fixing_date']) < document.getDate(collected[code][period][1]):
-								collected[code][period] = [datas[code][period],document.data['fixing_date']]
-					else:
-						collected[code][period] = [datas[code][period],document.data['fixing_date']]
+							#print('Code: ', code,'. Period: ', period,'. Err: different values',
+							#' curr: ', collected[code][period][0], '(',collected[code][period][1],')',
+							#'  new: ', datas[code][period], '(',document.data['fixing_date'],')')
+							
+							fixing_date_old = document.getDate(collected[code][period][1])
+							fixing_date_new = document.getDate(document.data['fixing_date'])
+
+							if fixing_date_old == fixing_date_new:
+								filing_date_old = document.getDate(collected[code][period][2])
+								filing_date_new = document.getDate(document.data['filing_date'])
+								if filing_date_old < filing_date_new:
+									isSet = True
+							elif fixing_date_new < fixing_date_old:
+								isSet = True
+							
+					if isSet:
+						collected[code][period] = [
+							datas[code][period],
+							document.data['fixing_date'],
+							document.data['filing_date'],
+							document.data['period']]
 
 		for code in collected:
 			for period in collected[code]:
-				result[code][period] = collected[code][period][0]
+				try:
+					value_old = data.at[period,code]
+					value_new = collected[code][period][0]
+					if value_old != value_new:
+						if period == collected[code][period][3]:
+							data.at[period,code] = value_new
+				except KeyError:
+					dataNew[code][period] = collected[code][period][0]
+					pass
 
-
-		return pd.DataFrame(result)
-
+		return pd.DataFrame(dataNew)
 
 
 class Document:
@@ -115,6 +147,7 @@ class Document:
 		self.data['xbrl_url'] = self.getXBRLurl()
 		self.data['file'] = None
 		self.data['fixing_date'] = None
+		self.data['period'] = None
 
 	def getXBRLurl(self):
 		filing = urlopen(self.data['filing_url']).read()
@@ -150,6 +183,25 @@ class Document:
 				period = '{}m9'.format( date1.year)
 		return period
 
+	def setPeriod(self):
+		if self.data['fixing_date'] is not None:
+			date = self.getDate( self.data['fixing_date'])
+			if date.month in [3,6,9]:
+				period = '{}Q{}'.format( date.year, int(date.month/3))
+				if 'Q' not in self.data['filing_type']:
+					print('*** No period', self.data['fixing_date'])
+			elif date.month == 12:
+				period = '{}Y'.format( date.year)
+				if 'K' not in self.data['filing_type']:
+					print('*** No period', self.data['fixing_date'])
+		else:
+			date = self.getDate( self.data['filing_date'])
+			if 'K' in self.data['filing_type']:
+				period = '{}Y'.format( date.year - 1)
+			elif 'Q' in self.data['filing_type']:
+				period = '{}Q{}'.format( date.year, int(date.month/3))
+		self.data['period'] = period
+
 	def getContext(self, soup, contextRef):
 		contexts = soup.getElementsByTagNameNS('*','context')
 		data = {}
@@ -177,6 +229,11 @@ class Document:
 		xbrl_data = open( self.data['file'], 'r')
 		soup = minidom.parse(xbrl_data)
 
+		periods = soup.getElementsByTagNameNS('*','DocumentPeriodEndDate')
+		if len(periods)>0:
+			self.data['fixing_date'] = periods[0].firstChild.nodeValue
+		else: print('*** no DocumentPeriodEndDate tag. File: ', self.data['file'])
+
 		_contexts = soup.getElementsByTagNameNS('*','context')
 		contexts = {}
 		for context in _contexts:
@@ -199,6 +256,7 @@ class Document:
 				pass
 
 		datapoints = {}
+		fixing_date = ''
 		for code in codes:
 			datapoints[code] = {}
 			code_soup = soup.getElementsByTagNameNS('*', code)
@@ -206,24 +264,76 @@ class Document:
 				contextRef = point.attributes['contextRef'].value
 				if contextRef in contexts:
 					period = contexts[contextRef]['period']
-					datapoints[code][period] = point.firstChild.nodeValue
-					end_date = contexts[contextRef]['end']
-					if self.data['fixing_date'] is None or self.getDate(end_date) > self.getDate(self.data['fixing_date']):
-						self.data['fixing_date'] = end_date
+					datapoints[code][period] = int(point.firstChild.nodeValue)
+
+					if self.data['fixing_date'] is None:
+						end_date = contexts[contextRef]['end']
+						if fixing_date=='' or self.getDate(end_date) > self.getDate(fixing_date):
+							fixing_date = end_date
+		
+		if self.data['fixing_date'] is None:
+			self.data['fixing_date'] = fixing_date
+		self.setPeriod()
+
 		return datapoints
 
 
-#db = pd.ExcelFile('data.xlsx')
-dat = pd.read_excel( 'in.xlsx', sheet_name='descr')
-writer = pd.ExcelWriter('data.xlsx')
-for cik in dat.transpose().index:
+
+stateOutFile = 1
+try:
+	out = pd.ExcelFile('data.xlsx')
+except FileNotFoundError: #file doesn't exist
+	print('Output data file error. All files will be re-parsed')
+	stateOutFile = 2
+	pass
+
+work = pd.read_excel( 'in.xlsx', sheet_name='descr')
+writerResult = pd.ExcelWriter('data.xlsx')
+for cik in work.columns:
 	print( cik)
-	codes = []
-	for code in dat.index:
-		if dat.at[code,cik]==1: codes.append(code)
 	comp = Company(cik)
-	data = comp.getSeries(codes)
-	data.to_excel( writer, cik, freeze_panes = (1,1))
-writer.save()
+
+	data = pd.DataFrame()
+	if stateOutFile == 1 and cik in out.sheet_names:
+		data = pd.read_excel( out, sheet_name=cik)
+	else: 
+		comp.task = 2
+	
+	codes = []
+	for code in work.index:
+		if work.at[code,cik] > 0: 
+			codes.append(code)
+			if work.at[code,cik] == 2:
+				comp.task = 2
+	
+	dataNew = comp.getSeries(codes,data)
+	data = pd.concat( [data, dataNew])
+	data.sort_index()
+
+	#delete empty columns
+	data = data.dropna( axis='columns', how='all')
+	for code in work.index:
+		if work.at[code,cik] > 0: 
+			if code in data.columns:
+				work.at[code,cik] = 1
+			else:
+				work.at[code,cik] = 0
+
+	data.to_excel( writerResult, cik, freeze_panes = (1,1))
+writerResult.save()
+writerResult.close()
 
 
+#save results of work
+xl = Dispatch("Excel.Application")
+xl.Visible = True # otherwise excel is hidden
+wb = xl.Workbooks.Open( os.path.realpath('.') + '\\' + 'in')
+sh = wb.Worksheets('descr')
+i_m = len(work.index)
+j_m = len(work.columns)
+for i in range(len(work.index)):
+	for j in range(len(work.columns)):
+		sh.Range('B2').Offset( 1 + i, 1 + j).Value2 = int(work.iat[ i, j])
+wb.Save()
+wb.Close()
+xl.Quit()
